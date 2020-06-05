@@ -79,29 +79,6 @@ class treeNode:
 
 class MyExecutor(object):
 
-    def get_scores_of_node(self, node):
-        actions = list()
-        scores = list()
-        rewards = list()
-        for action, action_stats in node.actions.items():
-            if node.numVisits <= 0:
-                reward = 0
-                score = float(2 ** 30)
-
-            elif action_stats['Visits'] <= 0:
-                reward = 0
-                score = float(2 ** 30)
-            else:
-                reward = float(action_stats['Rewards']) / action_stats['Visits']
-                exploration_factor = math.sqrt(math.log(node.numVisits) / action_stats['Visits'])
-                score = reward + (self.mtc_exploration_constant * exploration_factor)
-
-            actions.append(action)
-            scores.append(score)
-            rewards.append(reward)
-
-        return actions, scores, rewards
-
     def __init__(self, exploration_rate_start=None, policy_path=None, train_mode=True, steps_until_reset=65):
         self.train_mode = train_mode
         self.mtc_root = None
@@ -122,6 +99,7 @@ class MyExecutor(object):
         self.depth_limit_reward = 0.0
         self.step_penelty = -0.01
         self.step_in_loop_penelty = 0.0
+        self.history_repeat_penalty = -0.05
         self.loop_break_penelty = -4.0
 
         self.visit_limit_to_avoid_loops = 4
@@ -305,13 +283,17 @@ class MyExecutor(object):
             current_step_penelty = 0
             c_steps_to_termination = 0
             traveled_path.reverse()
+
             for parent_node_sig, parent_action, node_sig in traveled_path:
                 node = self.mtc_guide[node_sig]
                 parent_node = self.mtc_guide.get(parent_node_sig)
                 parent_node.numVisits += 1
                 propagation_size += 1
                 predicates_solved_reward = (parent_node.goalRemain - node.goalRemain) * self.predicat_completion_reward
-                reward = termination_reward + current_step_penelty + predicates_solved_reward
+                revisiting_old_path_penalty = self.traveled_path_histogram.get(node_sig,
+                                                                               0.0) * self.history_repeat_penalty
+
+                reward = termination_reward + current_step_penelty + predicates_solved_reward + revisiting_old_path_penalty
                 parent_node.add_action_reward(action=parent_action,
                                               reward=reward,
                                               termination_reason=termination_reason)
@@ -455,6 +437,29 @@ class MyExecutor(object):
             pass
 
         return state_node
+
+    def get_scores_of_node(self, node):
+        actions = list()
+        scores = list()
+        rewards = list()
+        for action, action_stats in node.actions.items():
+            if node.numVisits <= 0:
+                reward = 0
+                score = float(2 ** 30)
+
+            elif action_stats['Visits'] <= 0:
+                reward = 0
+                score = float(2 ** 30)
+            else:
+                reward = float(action_stats['Rewards']) / action_stats['Visits']
+                exploration_factor = math.sqrt(math.log(node.numVisits) / action_stats['Visits'])
+                score = reward + (self.mtc_exploration_constant * exploration_factor)
+
+            actions.append(action)
+            scores.append(score)
+            rewards.append(reward)
+
+        return actions, scores, rewards
 
     ##############################################################################################
     ###################################     domain functions   ###################################
@@ -617,7 +622,7 @@ if __name__ == '__main__':
     worlds['simple_web'] = (r"C:\school\cognitive\cognitive_project\domain_simple.pddl",
                             r"C:\school\cognitive\cognitive_project\problem_simple_web.pddl")
 
-    current_world = 'simple'
+    current_world = 'rover'
     args = sys.argv
     run_mode_flag = 'L'
     domain_path = worlds[current_world][0]  # args[2]
@@ -630,7 +635,7 @@ if __name__ == '__main__':
     if train_mode:
         # Train mode
         global_start_time = datetime.now()
-        iterations = 8
+        iterations = 1
         moving_average_window = 1
         results_moving_average = list()
         rewards_moving_average = list()
@@ -641,8 +646,10 @@ if __name__ == '__main__':
             print(ret_message)
         print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
 
-    # Test mode
-    simulator = LocalSimulator()
-    executor = MyExecutor(policy_path=policy_path, train_mode=False, steps_until_reset=270)
-    ret_message = simulator.run(domain_path, problem_path, executor)
-    print(ret_message)
+    else:
+
+        # Test mode
+        simulator = LocalSimulator()
+        executor = MyExecutor(policy_path=policy_path, train_mode=False, steps_until_reset=270)
+        ret_message = simulator.run(domain_path, problem_path, executor)
+        print(ret_message)
