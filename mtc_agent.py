@@ -39,17 +39,18 @@ def get_node_id():
 
 class treeNode:
     def __init__(self, state, parent=None, originating_action=None, terminal=False, exploration_constant=None):
-        self.exploraction_constant = exploration_constant
+        self.committed_path = list()
+        self.exploration_constant = exploration_constant
         self.node_id = get_node_id()
         self.state = state
         self.state_sig = None
-        self.originating_action = originating_action
         self.isTerminal = terminal
         self.isDeadEnd = False
         self.goalRemain = 10000
         self.isFullyExpanded = self.isTerminal
         self.parent = parent
         self.parent_sig = None
+        self.parent_action = originating_action
         self.numVisits = 0
         self.totalReward = 0
         self.wins = 0
@@ -58,6 +59,23 @@ class treeNode:
         self.actions = dict()
         self.depth = 0
 
+    def add_action(self, action):
+        if action in self.actions:
+            j = 3
+        else:
+            self.actions[action] = dict()
+            self.actions[action]['Visits'] = 0
+            self.actions[action]['Rewards'] = 0
+
+    def add_action_reward(self, action, reward, termination_reason=None):
+        if action not in self.actions:
+            self.add_action(action)
+
+        self.actions[action]['Visits'] = self.actions[action]['Visits'] + 1
+        self.actions[action]['Rewards'] = self.actions[action]['Rewards'] + reward
+        if termination_reason is not None:
+            self.actions[action][termination_reason] = self.actions[action].get(termination_reason, 0) + 1
+
 
 class MyExecutor(object):
 
@@ -65,51 +83,57 @@ class MyExecutor(object):
         actions = list()
         scores = list()
         rewards = list()
-        child_nodes = list()
-        for action, child_sig in node.children_sig.items():
-            child = self.mtc_guide.get(child_sig)
+        for action, action_stats in node.actions.items():
             if node.numVisits <= 0:
                 reward = 0
                 score = float(2 ** 30)
 
-            elif child.numVisits <= 0:
+            elif action_stats['Visits'] <= 0:
                 reward = 0
                 score = float(2 ** 30)
             else:
-                reward = float(child.totalReward) / child.numVisits
-                exploration_factor = math.sqrt(math.log(node.numVisits) / child.numVisits)
+                reward = float(action_stats['Rewards']) / action_stats['Visits']
+                exploration_factor = math.sqrt(math.log(node.numVisits) / action_stats['Visits'])
                 score = reward + (self.mtc_exploration_constant * exploration_factor)
 
-            child_nodes.append(child)
             actions.append(action)
             scores.append(score)
             rewards.append(reward)
 
-        return child_nodes, actions, scores, rewards
+        return actions, scores, rewards
 
     def __init__(self, exploration_rate_start=None, policy_path=None, train_mode=True, steps_until_reset=65):
         self.train_mode = train_mode
         self.mtc_root = None
         self.mtc_root_sig = None
-        self.mtc_exploration_constant = 13 * math.sqrt(2.0)
-        self.mtc_max_depth = 30
-        self.mtc_iteration_limit = 10
+
+        if train_mode:
+            self.mtc_exploration_constant = 13 * math.sqrt(2.0)
+            self.mtc_iteration_limit = 50
+        else:
+            self.mtc_exploration_constant = 5 * math.sqrt(2.0)
+            self.mtc_iteration_limit = 2
 
         self.mtc_guide = dict()
 
-        self.completion_reward = 10.0
-        self.predicat_completion_reward = +4.0
+        self.completion_reward = 20.0
+        self.predicat_completion_reward = +7.0
         self.dead_end_reward = -2.0
         self.depth_limit_reward = 0.0
         self.step_penelty = -0.01
-        self.loop_penelty = -2.0
+        self.step_in_loop_penelty = 0.0
+        self.loop_break_penelty = -4.0
 
+        self.visit_limit_to_avoid_loops = 4
+        self.depth_limit = 40
         self.current_step = 0
         self.steps_cap = 150
         self.total_agent_runs = 0
         self.policy_path = policy_path
 
-        self.traveled_path = dict()
+        self.traveled_path_histogram = dict()
+        self.traveled_path = list()
+        self.traveled_path_actions = list()
 
         if os.path.exists(self.policy_path):
             self.import_policy()
@@ -133,9 +157,9 @@ class MyExecutor(object):
         current_state_sig = self.state_to_str(current_state)
         goals_reached = self.services.goal_tracking.reached_all_goals()
         self.current_step += 1
-        if current_state_sig in self.traveled_path:
+        if current_state_sig in self.traveled_path_histogram:
             print("--> potential loop <---")
-        self.traveled_path[current_state_sig] = self.current_step
+        self.traveled_path_histogram[current_state_sig] = self.current_step
 
         if goals_reached:
             self.export()
@@ -144,9 +168,11 @@ class MyExecutor(object):
             self.export()
             return None
 
-        self.mtc_search(current_state)
-        self.mtc_display_choices(current_state_sig)
+        avg_depth = self.mtc_search(current_state)
+        self.mtc_display_choices(current_state_sig, avg_depth)
         optimal_action = self.mtc_recommend(current_state_sig)
+        self.traveled_path += [current_state_sig]
+        self.traveled_path_actions += [optimal_action]
         return optimal_action
 
     ##############################################################################################
@@ -162,21 +188,27 @@ class MyExecutor(object):
             self.current_node = self.mtc_guide.get(self.current_node_sig)
 
         time.sleep(0.1)
-        for i in tqdm(range(self.mtc_iteration_limit)):
-            reward, chosen_path = self.mtc_executeRound(self.current_node_sig)
+        depths = list()
+        for current_mtc_idx in tqdm(range(self.mtc_iteration_limit), desc='[Step: {}]'.format(self.current_step)):
+            reward, chosen_path, path_depth = self.mtc_executeRound(self.current_node_sig)
+            depths += [path_depth]
             # print("Round {}/{}\tReward: {}\tAction: {}".format(i + 1, self.mtc_iteration_limit, reward,
             #                                                    chosen_path))
         time.sleep(0.1)
-        return None
 
-    def mtc_executeRound(self, start_node_sig=None):
-        if start_node_sig is None:
-            start_node_sig = self.mtc_root_sig
-        node_sig, initial_action = self.mtc_selectNode(start_node_sig)
-        reward, initial_action_rollout, steps_to_termination, termination_reason, termination_state_sig = self.mtc_rollout(
-            node_sig)
-        self.mtc_backpropogate(termination_state_sig, reward, steps_to_termination, termination_reason)
-        return reward, initial_action
+        avg_depth = np.mean(depths)
+        return avg_depth
+
+    def mtc_executeRound(self, start_node_sig):
+        initial_simulated_node_sig, initial_action = self.mtc_selectNode(start_node_sig)
+        first_step_token = (start_node_sig, initial_action, initial_simulated_node_sig)
+        reward, initial_action_rollout, steps_to_termination, termination_reason, simulation_traveled_path = self.mtc_rollout(
+            initial_simulated_node_sig)
+
+        simulation_traveled_path = [first_step_token] + simulation_traveled_path
+        path_depth = len(simulation_traveled_path)
+        self.mtc_backpropogate(simulation_traveled_path, reward, steps_to_termination, termination_reason)
+        return reward, initial_action, path_depth
 
     def mtc_rollout(self, state_sig):
         # Random search policy, without repetitions
@@ -184,14 +216,16 @@ class MyExecutor(object):
         state = state_node.state
         hit_goal = self.hit_goal(state)
         dead_end = self.hit_dead_end(state)
-        traveled_path = dict()
+        entered_loop = False
+        traveled_path_histogram = dict()
+        simulation_traveled_path = list()
         current_mtc_depth = 0
-        initial_action = None
         chosen_action = None
         path_reward = 0
         rollout_step = 0
         termination_reason = 'RUNNING'
-        initial_goal_remain = self.unfulfilled_goals_count(state)
+        # Terminations types: GOAL , LOOP , DEAD END
+        initial_goal_remain = state_node.goalRemain
 
         while True:
             original_state_sig = self.state_to_str(state)
@@ -205,92 +239,84 @@ class MyExecutor(object):
                 termination_reason = 'DEAD END'
                 break
 
-            # pos = list(state['at'])[0][1]
-            # if pos == 't1':
-            #     j = 3
+            if entered_loop:
+                # Loop
+                path_reward += self.loop_break_penelty
+                termination_reason = 'LOOP'
+                break
 
+            if rollout_step > self.depth_limit:
+                # Depth limit
+                path_reward += self.depth_limit_reward
+                termination_reason = 'DEPTH CAP'
+                break
+
+            # Calculate step options
             rollout_step += 1
             valid_actions = self.get_valid_action_from_state(state)
-            valid_destinations_states = [(t_action, self.apply_action_to_state(t_action, state))
-                                         for t_action in valid_actions]
-
-            valid_destinations_states_sigs = [(t_action, t_state, self.state_to_str(t_state))
-                                              for t_action, t_state in valid_destinations_states]
-
-            # valid_destinations_states_sigs = [(t_action, t_state, t_state_sig)
-            #                                   for t_action, t_state, t_state_sig in valid_destinations_states_sigs
-            #                                   if t_state_sig not in traveled_path]
-            if len(valid_destinations_states_sigs) == 0:
-                # DEAD END
-                path_reward += self.dead_end_reward
-                termination_reason = 'DEAD END'
-                break
-                # if current_mtc_depth > self.mtc_max_depth:
-                #     # depth cap
-                #     termination_reason = 'STEP CAP'
-                #     path_reward += self.depth_limit_reward
-                #     break
-                j = 3
+            chosen_action = random.choice(valid_actions)
+            chosen_state = self.apply_action_to_state(chosen_action, state)
+            chosen_state_sig = self.state_to_str(chosen_state)
+            traveled_path_histogram[original_state_sig] = traveled_path_histogram.get(original_state_sig, 0) + 1
+            simulation_traveled_path.append((original_state_sig, chosen_action, chosen_state_sig))
+            next_state_node = self.mtc_guide.get(chosen_state_sig, None)
+            if next_state_node is None:
+                next_state_node = self.mtc_generate_node(state=chosen_state, parent=state_node,
+                                                         originating_action=chosen_action)
             else:
-                chosen_action, chosen_state, chosen_state_sig = random.choice(valid_destinations_states_sigs)
-                traveled_path[original_state_sig] = True
-                next_state_node = self.mtc_guide.get(chosen_state_sig, None)
-                if next_state_node is None:
-                    next_state_node = self.mtc_generate_node(state=chosen_state, parent=state_node,
-                                                             originating_action=chosen_action)
+                # This path has been traveresed
+                # maybe replace the random policy?
+                pass
 
-                # Handle loops
-                if chosen_state_sig in traveled_path:
-                    path_reward += self.loop_penelty
-                    termination_reason = 'LOOP'
-                    break
+            # Handle loops
+            if chosen_state_sig in traveled_path_histogram:
+                path_reward += self.step_in_loop_penelty
+                visits_to_current_state = traveled_path_histogram[chosen_state_sig]
+                if visits_to_current_state > self.visit_limit_to_avoid_loops:
+                    entered_loop = True
 
-                state = chosen_state
-                state_node = next_state_node
-                state_sig = self.state_to_str(state)
+            state = chosen_state
+            state_node = next_state_node
+            state_sig = self.state_to_str(state)
 
-                hit_goal = self.hit_goal(state)
-                dead_end = self.hit_dead_end(state)
-                current_mtc_depth += 1
-                if initial_action is None:
-                    initial_action = chosen_action
+            hit_goal = self.hit_goal(state)
+            dead_end = self.hit_dead_end(state)
+            current_mtc_depth += 1
 
-        termination_state_sig = original_state_sig
-        return path_reward, chosen_action, rollout_step, termination_reason, termination_state_sig
+        return path_reward, chosen_action, rollout_step, termination_reason, simulation_traveled_path
 
-    def mtc_backpropogate(self, termination_state_sig, termination_reward, steps_to_termination, termination_reason):
-        c_steps_to_termination = steps_to_termination
-        node = self.mtc_guide.get(termination_state_sig)
-        propagation_size = 0
-        current_step_penelty = 0
-        c_steps_to_termination = 0
-        while True:
-            propagation_size += 1
-            node.numVisits += 1
-            node.total_steps = c_steps_to_termination
-            node.wins += int(termination_reason == 'GOAL')
-            node.dead_ends += int(termination_reason == 'DEAD END')
-
-            # if node.state_sig == self.current_node_pointer.state_sig:
-            #     break
-
-            parent_node_sig = node.parent_sig
+    def mtc_backpropogate(self, traveled_path, termination_reward, steps_to_termination, termination_reason):
+        if termination_reason == 'DEPTH CAP':
+            # update just current action
+            parent_node_sig, parent_action, _ = traveled_path[0]
+            _, _, node_sig = traveled_path[-1]
+            node = self.mtc_guide.get(node_sig)
             parent_node = self.mtc_guide.get(parent_node_sig)
-            predicates_solved_reward = 0
-            if parent_node_sig is not None:
+
+            predicates_solved_reward = (parent_node.goalRemain - node.goalRemain) * self.predicat_completion_reward
+            reward = self.depth_limit_reward + predicates_solved_reward
+            parent_node.add_action_reward(action=parent_action,
+                                          reward=reward,
+                                          termination_reason=termination_reason)
+
+
+        else:
+            propagation_size = 0
+            current_step_penelty = 0
+            c_steps_to_termination = 0
+            traveled_path.reverse()
+            for parent_node_sig, parent_action, node_sig in traveled_path:
+                node = self.mtc_guide[node_sig]
+                parent_node = self.mtc_guide.get(parent_node_sig)
+                parent_node.numVisits += 1
+                propagation_size += 1
                 predicates_solved_reward = (parent_node.goalRemain - node.goalRemain) * self.predicat_completion_reward
-            # Calculate reward
-            reward = termination_reward + current_step_penelty + predicates_solved_reward
-            node.totalReward += reward
-
-            node = parent_node
-            c_steps_to_termination += 1
-            current_step_penelty += self.step_penelty
-
-            if node is None:
-                break
-
-        # print("Prop --> {}".format(propagation_size))
+                reward = termination_reward + current_step_penelty + predicates_solved_reward
+                parent_node.add_action_reward(action=parent_action,
+                                              reward=reward,
+                                              termination_reason=termination_reason)
+                c_steps_to_termination += 1
+                current_step_penelty += self.step_penelty
 
     def mtc_selectNode(self, node_sig):
         node = self.mtc_guide.get(node_sig)
@@ -315,12 +341,11 @@ class MyExecutor(object):
     def mtc_expand(self, node):
         actions = self.get_valid_action_from_state(node.state)
         for action in actions:
-            if action not in node.children_sig.keys():
+            if action not in node.actions.keys():
                 # Action is not explored
                 new_state = self.apply_action_to_state(action, node.state)
                 newNode = self.mtc_generate_node(state=new_state, parent=node, originating_action=action)
-                node.children_sig[action] = newNode.state_sig
-                if len(actions) == len(node.children_sig):
+                if len(actions) == len(node.actions):
                     node.isFullyExpanded = True
                 return newNode.state_sig, action
 
@@ -328,19 +353,19 @@ class MyExecutor(object):
         return node_sig, action
 
     def mtc_getBestChild(self, node, exploit=False):
-        if type(node) is type('str'):
-            j = 3
-
-        child_nodes, actions, scores, rewards = self.get_scores_of_node(node)
+        actions, scores, rewards = self.get_scores_of_node(node)
+        if len(actions) <= 0:
+            return None, None
         if exploit:
             chosen_node_idx = np.argmax(rewards)
         else:
             chosen_node_idx = np.argmax(scores)
 
-        chosen_node = child_nodes[chosen_node_idx]
-        chosen_node_sig = chosen_node.state_sig
+        node_state = node.state
         chosen_action = actions[chosen_node_idx]
-        return chosen_node_sig, chosen_action
+        chosen_state = self.apply_action_to_state(chosen_action, node_state)
+        chosen_state_sig = self.state_to_str(chosen_state)
+        return chosen_state_sig, chosen_action
 
     def mtc_recommend(self, current_node_sig=None):
         if current_node_sig is None:
@@ -349,39 +374,58 @@ class MyExecutor(object):
         chosen_node, chosen_action = self.mtc_getBestChild(current_node, exploit=True)
         return chosen_action
 
-    def mtc_display_choices(self, current_node_sig):
+    def mtc_display_choices(self, current_node_sig, avg_depth=-1):
 
         current_node = self.mtc_guide.get(current_node_sig)
         current_predicates = current_node.goalRemain
+        total_visits = 0
         print('_______________________________________________________________________________')
         print('_______________________________________________________________________________')
-        child_nodes, actions, scores, rewards = self.get_scores_of_node(current_node)
-        max_reward_idx = np.argmax(rewards)
-        max_score_idx = np.argmax(scores)
 
-        for child_idx, child in enumerate(child_nodes):
-            expected_predicates = child.goalRemain
-            best_score_pointer = ''
-            if child_idx == max_reward_idx:
-                best_score_pointer = '@\t'
-            best_reward_pointer = ''
-            if child_idx == max_score_idx:
-                best_reward_pointer = 'O\t'
+        actions, scores, rewards = self.get_scores_of_node(current_node)
+        if len(actions) > 0:
+            max_reward_idx = np.argmax(rewards)
+            max_score_idx = np.argmax(scores)
+            for action_idx, action in enumerate(actions):
+                action_stats = current_node.actions[action]
+                best_score_pointer = ''
+                if action_idx == max_reward_idx:
+                    best_score_pointer = '@\t'
+                best_reward_pointer = ''
+                if action_idx == max_score_idx:
+                    best_reward_pointer = 'O\t'
 
-            visits = child.numVisits
-            if visits == 0:
-                visits = -1
-            action = actions[child_idx]
-            msg = ''
-            # msg += '[Expended: {}]\t'.format(child.isFullyExpanded)
-            msg += "Score: {:>+.6f}\t".format(scores[child_idx])
-            msg += "Rewards: {:>+.5f}\t".format(rewards[child_idx])
-            msg += "Wins: {}/{} ({:>.3f})\t".format(child.wins, visits, float(child.wins) / visits)
-            # msg += "DeadEnds: {}/{}\t".format(child.dead_ends, visits)
-            # msg += "Steps: {:>5.2f}\t".format(float(child.total_steps) / child.numVisits)
-            msg += "Expected goals: {}-->{}\t".format(current_predicates, expected_predicates)
-            msg += "{}{}{}".format(best_reward_pointer, best_score_pointer, action)
-            print(msg)
+                visits = action_stats['Visits']
+                total_visits += visits
+                wins = action_stats.get('GOAL', 0)
+                loops = action_stats.get('LOOP', 0)
+                deadends = action_stats.get('DEAD END', 0)
+                depth_cap = action_stats.get('DEPTH CAP', 0)
+                if visits == 0:
+                    visits = -1
+                action = actions[action_idx]
+                msg = ''
+                # msg += '[Expended: {}]\t'.format(child.isFullyExpanded)
+                msg += "Score: {:>+.6f}\t".format(scores[action_idx])
+                msg += "Rewards: {:>+.5f}\t".format(rewards[action_idx])
+                msg += "Wins: {}/{} ({:>.3f})\t".format(wins, visits, float(wins) / visits)
+                msg += "loops: {}/{} ({:>.3f})\t".format(loops, visits, float(loops) / visits)
+                msg += "dead-ends: {}/{} ({:>.3f})\t".format(deadends, visits, float(deadends) / visits)
+                msg += "depth-cap: {}/{} ({:>.3f})\t".format(depth_cap, visits, float(depth_cap) / visits)
+                # msg += "DeadEnds: {}/{}\t".format(child.dead_ends, visits)
+                # msg += "Steps: {:>5.2f}\t".format(float(child.total_steps) / child.numVisits)
+                msg += "{}{}{}".format(best_reward_pointer, best_score_pointer, action)
+                print(msg)
+        else:
+            print("NO AVAILABLE ACTIONS")
+        print("-------------------------------------------------------------------------------")
+        msg = ''
+        msg += 'Current predicates: {}\t'.format(current_predicates)
+        msg += 'Total visits: {}\t'.format(total_visits)
+        msg += 'Avg depth: {:>.1f}\t'.format(avg_depth)
+        msg += 'Tree size: {}\t'.format(current_node_id)
+        print(msg)
+        print('')
         print('_______________________________________________________________________________')
 
     ##############################################################################################
@@ -573,7 +617,7 @@ if __name__ == '__main__':
     worlds['simple_web'] = (r"C:\school\cognitive\cognitive_project\domain_simple.pddl",
                             r"C:\school\cognitive\cognitive_project\problem_simple_web.pddl")
 
-    current_world = 'rover'
+    current_world = 'simple'
     args = sys.argv
     run_mode_flag = 'L'
     domain_path = worlds[current_world][0]  # args[2]
@@ -586,15 +630,16 @@ if __name__ == '__main__':
     if train_mode:
         # Train mode
         global_start_time = datetime.now()
-        iterations = 80
-        moving_average_window = 30
+        iterations = 8
+        moving_average_window = 1
         results_moving_average = list()
         rewards_moving_average = list()
-        for i in range(iterations):
+        for current_simulation_id in range(iterations):
             simulator = LocalSimulator()
             executor = MyExecutor(policy_path=policy_path, train_mode=True)
             ret_message = simulator.run(domain_path, problem_path, executor)
             print(ret_message)
+        print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
 
     # Test mode
     simulator = LocalSimulator()
