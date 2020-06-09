@@ -1,13 +1,13 @@
 # Name: Guy Barash
 # ID  : 301894234
 import hashlib
-import json
 import math
 import os
 import pickle
 import random
 import sys
 import numpy as np
+import re
 from datetime import datetime
 
 import pddlsim
@@ -64,8 +64,8 @@ class treeNode:
             j = 3
         else:
             self.actions[action] = dict()
-            self.actions[action]['Visits'] = 0
-            self.actions[action]['Rewards'] = 0
+            self.actions[action]['Visits'] = 0.0
+            self.actions[action]['Rewards'] = 0.0
 
     def add_action_reward(self, action, reward, termination_reason=None):
         if action not in self.actions:
@@ -79,64 +79,85 @@ class treeNode:
 
 class MyExecutor(object):
 
-    def __init__(self, exploration_rate_start=None, policy_path=None, train_mode=True, steps_until_reset=65):
+    def __init__(self, policy_path=None, train_mode=True, steps_until_reset=65):
         self.train_mode = train_mode
         self.mtc_root = None
         self.mtc_root_sig = None
 
-        if train_mode:
-            self.mtc_exploration_constant = 13 * math.sqrt(2.0)
-            self.mtc_iteration_limit = 50
-        else:
-            self.mtc_exploration_constant = 5 * math.sqrt(2.0)
-            self.mtc_iteration_limit = 2
-
         self.mtc_guide = dict()
 
-        self.completion_reward = 20.0
-        self.predicat_completion_reward = +7.0
+        self.completion_reward = 30.0
+        self.predicat_completion_reward = +10.0
         self.dead_end_reward = -2.0
         self.depth_limit_reward = 0.0
         self.step_penelty = -0.01
         self.step_in_loop_penelty = 0.0
-        self.history_repeat_penalty = -0.05
+        self.history_repeat_penalty = -1.0
         self.loop_break_penelty = -4.0
 
         self.visit_limit_to_avoid_loops = 4
-        self.depth_limit = 40
+        self.depth_limit = 45
         self.current_step = 0
-        self.steps_cap = 150
+        self.steps_cap = 100
         self.total_agent_runs = 0
         self.policy_path = policy_path
 
         self.traveled_path_histogram = dict()
         self.traveled_path = list()
         self.traveled_path_actions = list()
-
-        if os.path.exists(self.policy_path):
-            self.import_policy()
+        self.travel_path_history = list()
 
     def initialize(self, services):
         self.services = services
         self.domain = services.parser.domain_name
         self.problem = services.parser.problem_name
+        self.world_name = '{}___{}'.format(self.domain, self.problem)
         self.is_probalistic_game = any([type(action) == pddlsim.parser_independent.ProbabilisticAction
                                         for (name, action) in
                                         self.services.valid_actions.provider.parser.actions.items()])
 
+        self.is_action_determenistic = dict()
+        for (name, action) in self.services.valid_actions.provider.parser.actions.items():
+            self.is_action_determenistic[name] = not type(action) == pddlsim.parser_independent.ProbabilisticAction
+
+        self.action_types = [action_name for action_name, action in
+                             self.services.valid_actions.provider.parser.actions.items()]
         self.is_hidden_info_game = len(self.services.valid_actions.provider.parser.revealable_predicates) > 0
         self.initial_state = self.services.perception.get_state()
+        self.initial_action_count = len(self.get_valid_action_from_state(self.initial_state))
         self.initial_goals_count = self.unfulfilled_goals_count(self.initial_state)
 
+        self.relevant_identities = set(self.get_all_goal_identities())
         self.mtc_root = None
+        self.policy_path = '{}_{}'.format(self.policy_path, self.world_name)
+
+        if os.path.exists(self.policy_path):
+            self.import_policy()
+
+        if self.train_mode:
+            self.mtc_exploration_constant = 13 * math.sqrt(2.0)
+            self.mtc_iteration_limit = 40
+        else:
+            self.mtc_exploration_constant = 5 * math.sqrt(2.0)
+            self.mtc_iteration_limit = 2
+
+        if 'satellite' in self.world_name:
+            # BFS Mode
+            print("BFS MODE")
+            self.mtc_exploration_constant = 13 * math.sqrt(2.0)
+            self.mtc_iteration_limit = 500
+            self.depth_limit = 3
+            self.mtc_guide = dict()
 
     def next_action(self):
         current_state = self.services.perception.get_state()
         current_state_sig = self.state_to_str(current_state)
+        if len(self.traveled_path) > 0:
+            token = (self.traveled_path[-1], self.traveled_path_actions[-1], current_state_sig)
+            self.travel_path_history.append(token)
+
         goals_reached = self.services.goal_tracking.reached_all_goals()
         self.current_step += 1
-        if current_state_sig in self.traveled_path_histogram:
-            print("--> potential loop <---")
         self.traveled_path_histogram[current_state_sig] = self.current_step
 
         if goals_reached:
@@ -147,10 +168,11 @@ class MyExecutor(object):
             return None
 
         avg_depth = self.mtc_search(current_state)
-        self.mtc_display_choices(current_state_sig, avg_depth)
         optimal_action = self.mtc_recommend(current_state_sig)
+        self.mtc_display_choices(current_state_sig, avg_depth, chosen_action=optimal_action)
         self.traveled_path += [current_state_sig]
         self.traveled_path_actions += [optimal_action]
+
         return optimal_action
 
     ##############################################################################################
@@ -161,9 +183,13 @@ class MyExecutor(object):
             self.mtc_root = self.mtc_generate_node(state=initial_state)
             self.mtc_root_sig = self.mtc_root.state_sig
             self.current_node_sig = self.mtc_root_sig
+            self.current_state = initial_state
         else:
+            self.current_state = initial_state
             self.current_node_sig = self.state_to_str(initial_state)
-            self.current_node = self.mtc_guide.get(self.current_node_sig)
+            self.current_node = self.mtc_guide.get(self.current_node_sig, None)
+            if self.current_node is None:
+                self.current_node = self.mtc_generate_node(state=initial_state)
 
         time.sleep(0.1)
         depths = list()
@@ -178,20 +204,24 @@ class MyExecutor(object):
         return avg_depth
 
     def mtc_executeRound(self, start_node_sig):
-        initial_simulated_node_sig, initial_action = self.mtc_selectNode(start_node_sig)
+        last_actions = None
+        if len(self.travel_path_history) > 0:
+            last_actions = [self.travel_path_history[-1]]
+        initial_simulated_node_sig, initial_action = self.mtc_selectNode(start_node_sig, last_actions=last_actions)
         first_step_token = (start_node_sig, initial_action, initial_simulated_node_sig)
-        reward, initial_action_rollout, steps_to_termination, termination_reason, simulation_traveled_path = self.mtc_rollout(
+        reward, initial_action_rollout, termination_reason, simulation_traveled_path = self.mtc_rollout(
             initial_simulated_node_sig)
 
         simulation_traveled_path = [first_step_token] + simulation_traveled_path
         path_depth = len(simulation_traveled_path)
-        self.mtc_backpropogate(simulation_traveled_path, reward, steps_to_termination, termination_reason)
+        self.mtc_backpropogate(simulation_traveled_path, reward, termination_reason)
         return reward, initial_action, path_depth
 
     def mtc_rollout(self, state_sig):
         # Random search policy, without repetitions
         state_node = self.mtc_guide.get(state_sig)
         state = state_node.state
+        state = self.check_reveal_predicates(state)
         hit_goal = self.hit_goal(state)
         dead_end = self.hit_dead_end(state)
         entered_loop = False
@@ -204,8 +234,11 @@ class MyExecutor(object):
         termination_reason = 'RUNNING'
         # Terminations types: GOAL , LOOP , DEAD END
         initial_goal_remain = state_node.goalRemain
+        last_valid_actions = list()
+        valid_actions = list()
 
         while True:
+
             original_state_sig = self.state_to_str(state)
             if hit_goal:
                 termination_reason = 'GOAL'
@@ -232,18 +265,19 @@ class MyExecutor(object):
             # Calculate step options
             rollout_step += 1
             valid_actions = self.get_valid_action_from_state(state)
-            chosen_action = random.choice(valid_actions)
+
+            chosen_action = self.choose_from_unvisited_actions(valid_actions, state,
+                                                               simulation_traveled_path)  # random.choice(valid_actions)
             chosen_state = self.apply_action_to_state(chosen_action, state)
+            chosen_state = self.check_reveal_predicates(chosen_state)
             chosen_state_sig = self.state_to_str(chosen_state)
             traveled_path_histogram[original_state_sig] = traveled_path_histogram.get(original_state_sig, 0) + 1
             simulation_traveled_path.append((original_state_sig, chosen_action, chosen_state_sig))
             next_state_node = self.mtc_guide.get(chosen_state_sig, None)
             if next_state_node is None:
-                next_state_node = self.mtc_generate_node(state=chosen_state, parent=state_node,
+                next_state_node = self.mtc_generate_node(state=chosen_state, parent_node=state_node,
                                                          originating_action=chosen_action)
             else:
-                # This path has been traveresed
-                # maybe replace the random policy?
                 pass
 
             # Handle loops
@@ -261,9 +295,18 @@ class MyExecutor(object):
             dead_end = self.hit_dead_end(state)
             current_mtc_depth += 1
 
-        return path_reward, chosen_action, rollout_step, termination_reason, simulation_traveled_path
+        if termination_reason == 'LOOP':
+            loop_state_sig = simulation_traveled_path[-1][2]
+            loop_state_count = traveled_path_histogram.get(loop_state_sig)
+            while loop_state_count > 0:
+                from_state_sig, commited_action, to_state_sig = simulation_traveled_path.pop()
+                if to_state_sig == loop_state_sig:
+                    loop_state_count -= 1
 
-    def mtc_backpropogate(self, traveled_path, termination_reward, steps_to_termination, termination_reason):
+        return path_reward, chosen_action, termination_reason, simulation_traveled_path
+
+    def mtc_backpropogate(self, traveled_path, termination_reward, termination_reason):
+        work_path = self.travel_path_history + traveled_path
         if termination_reason == 'DEPTH CAP':
             # update just current action
             parent_node_sig, parent_action, _ = traveled_path[0]
@@ -273,6 +316,7 @@ class MyExecutor(object):
 
             predicates_solved_reward = (parent_node.goalRemain - node.goalRemain) * self.predicat_completion_reward
             reward = self.depth_limit_reward + predicates_solved_reward
+            parent_node.numVisits += 1
             parent_node.add_action_reward(action=parent_action,
                                           reward=reward,
                                           termination_reason=termination_reason)
@@ -284,7 +328,7 @@ class MyExecutor(object):
             c_steps_to_termination = 0
             traveled_path.reverse()
 
-            for parent_node_sig, parent_action, node_sig in traveled_path:
+            for parent_node_sig, parent_action, node_sig in work_path:
                 node = self.mtc_guide[node_sig]
                 parent_node = self.mtc_guide.get(parent_node_sig)
                 parent_node.numVisits += 1
@@ -300,14 +344,16 @@ class MyExecutor(object):
                 c_steps_to_termination += 1
                 current_step_penelty += self.step_penelty
 
-    def mtc_selectNode(self, node_sig):
+    def mtc_selectNode(self, node_sig, last_actions=None):
         node = self.mtc_guide.get(node_sig)
+        if node is None:
+            j = 3
         hit = 0
         traveled_path = dict()
         while not node.isTerminal:
             if node.state_sig in traveled_path:
                 # Stuck in a loop
-                node_sig, action = self.mtc_expand(node)
+                node_sig, action = self.mtc_expand(node, last_actions)
                 return node_sig, action
             else:
                 traveled_path[node.state_sig] = True
@@ -316,114 +362,232 @@ class MyExecutor(object):
                 node_sig, action = self.mtc_getBestChild(node)
                 node = self.mtc_guide.get(node_sig)
             else:
-                node_sig, action = self.mtc_expand(node)
+                node_sig, action = self.mtc_expand(node, last_actions)
                 return node_sig, action
         return node_sig, None
 
-    def mtc_expand(self, node):
+    def mtc_expand(self, node, last_actions=None):
         actions = self.get_valid_action_from_state(node.state)
-        for action in actions:
-            if action not in node.actions.keys():
-                # Action is not explored
-                new_state = self.apply_action_to_state(action, node.state)
-                newNode = self.mtc_generate_node(state=new_state, parent=node, originating_action=action)
-                if len(actions) == len(node.actions):
-                    node.isFullyExpanded = True
-                return newNode.state_sig, action
+        actions = self.apply_domain_knowledge_on_actions(actions, state=node.state, last_actions=last_actions)
+        unvisited_actions = [action for action in actions if action not in node.actions.keys()]
+        if len(unvisited_actions) > 0:
+            action = self.choose_from_unvisited_actions(unvisited_actions, state=node.state, last_actions=last_actions)
+            new_state = self.apply_action_to_state(action, node.state)
+            newNode = self.mtc_generate_node(state=new_state, parent_node=node, originating_action=action)
+            if len(actions) == len(node.actions):
+                node.isFullyExpanded = True
+            return newNode.state_sig, action
 
         node_sig, action = self.mtc_getBestChild(node)
         return node_sig, action
 
-    def mtc_getBestChild(self, node, exploit=False):
-        actions, scores, rewards = self.get_scores_of_node(node)
+    def choose_from_unvisited_actions(self, actions, state=None, last_actions=None):
+        actions = self.apply_domain_knowledge_on_actions(actions, state=state, last_actions=last_actions)
+        if len(actions) > self.mtc_iteration_limit:
+            actions_per_type = dict()
+            prob_per_type = dict()
+            for action in actions:
+                action_type, action_params = self.services.parser.parse_action(action)
+                action_params = set(action_params)
+                actions_per_type[action_type] = actions_per_type.get(action_type, list()) + [action]
+                relevance = len(action_params.intersection(self.relevant_identities)) + 1.0
+                prob_per_type[action_type] = prob_per_type.get(action_type, list()) + [relevance]
+
+            chosen_type = random.choice(actions_per_type.keys())
+            possible_actions = actions_per_type[chosen_type]
+            possible_prob = np.array(prob_per_type[chosen_type])
+            possible_prob /= possible_prob.sum()
+            chosen_action = np.random.choice(possible_actions, p=possible_prob)
+        else:
+            chosen_action = np.random.choice(actions)
+
+        return chosen_action
+
+    def apply_domain_knowledge_on_actions(self, actions, state=None, last_actions=list()):
+        if 'satellite' in self.world_name:
+
+            # We're in the satellite domain
+            n_actions = list()
+            if len(state['power_on']) == 0:
+                n_actions = [t_action for t_action in actions if 'switch' in t_action]
+            else:
+                for action in actions:
+                    if 'switch_on' in action:
+                        n_actions.append(action)
+                    elif 'turn_to' in action:
+                        _, args = self.services.parser.parse_action(action)
+                        sat_id = args[0]
+                        planets = args[1:]
+                        current_planet = planets[1]
+                        target_planet = planets[0]
+                        if current_planet == target_planet:
+                            continue
+                        if len(planets) > 2 and (planets[0] != planets[2]):
+                            continue
+
+                        supported_inst = [inst[0] for inst in list(state['on_board']) if inst[1] == sat_id]
+                        calibrated_instruments = [t_inst[0] for t_inst in list(state['calibrated'])
+                                                  if t_inst[0] in supported_inst
+                                                  ]
+                        uncalibrated_instruments = [t_inst[0] for t_inst in list(state['power_on'])
+                                                    if (t_inst[0] not in calibrated_instruments)
+                                                    and (t_inst[0] in supported_inst)
+                                                    ]
+                        if len(calibrated_instruments) > 0:
+                            relevant_targets = self.get_all_goal_planets(state)
+                            goal = [value for value in relevant_targets if value == target_planet]
+                            if len(goal) > 0:
+                                n_actions.append(action)
+
+                        elif len(uncalibrated_instruments) > 0:
+                            relevant_targets = [t[1] for t in list(state['calibration_target'])
+                                                if t[0] in uncalibrated_instruments
+                                                ]
+                            goal = [value for value in relevant_targets if value == target_planet]
+                            if len(goal) > 0:
+                                n_actions.append(action)
+                            else:
+                                continue
+                        else:
+                            continue
+
+                    elif 'take_image' in action:
+                        _, args = self.services.parser.parse_action(action)
+                        relevant_targets = self.get_all_goal_planets(state)
+                        goal_planet = [value for value in args if value in relevant_targets]
+                        if len(goal_planet) > 0:
+                            n_actions.append(action)
+                        else:
+                            continue
+
+                    else:
+                        n_actions.append(action)
+
+            if len(n_actions) > 0:
+                return n_actions
+            else:
+                return actions
+
+
+        else:
+            return actions
+
+    def mtc_getBestChild(self, node, exploit=False, legal_actions=None):
+        actions, scores, rewards = self.get_scores_of_node(node, legal_actions)
         if len(actions) <= 0:
             return None, None
         if exploit:
-            chosen_node_idx = np.argmax(rewards)
+            max_val = np.max(rewards)
+            indexes = np.where(rewards == max_val)[0]
+            chosen_node_idx = np.random.choice(indexes)
         else:
-            chosen_node_idx = np.argmax(scores)
+            max_val = np.max(scores)
+            indexes = np.where(scores == max_val)[0]
+            chosen_node_idx = np.random.choice(indexes)
 
         node_state = node.state
         chosen_action = actions[chosen_node_idx]
         chosen_state = self.apply_action_to_state(chosen_action, node_state)
         chosen_state_sig = self.state_to_str(chosen_state)
+        if chosen_state_sig not in self.mtc_guide:
+            self.mtc_generate_node(state=chosen_state, parent_node=node, originating_action=chosen_action)
+
         return chosen_state_sig, chosen_action
 
     def mtc_recommend(self, current_node_sig=None):
         if current_node_sig is None:
             current_node_sig = self.current_node_pointer
         current_node = self.mtc_guide.get(current_node_sig)
-        chosen_node, chosen_action = self.mtc_getBestChild(current_node, exploit=True)
+
+        legal_actions = self.get_valid_action_from_state(self.current_state)
+        legal_actions = self.apply_domain_knowledge_on_actions(legal_actions, state=self.current_state,
+                                                               last_actions=self.travel_path_history)
+        while True:
+            chosen_node, chosen_action = self.mtc_getBestChild(current_node, exploit=True, legal_actions=legal_actions)
+            break
         return chosen_action
 
-    def mtc_display_choices(self, current_node_sig, avg_depth=-1):
+    def mtc_display_choices(self, current_node_sig, avg_depth=-1, chosen_action=None):
+        if self.train_mode:
+            current_node = self.mtc_guide.get(current_node_sig)
+            current_predicates = current_node.goalRemain
+            total_visits = 0
+            print('_______________________________________________________________________________')
+            print('_______________________________________________________________________________')
 
-        current_node = self.mtc_guide.get(current_node_sig)
-        current_predicates = current_node.goalRemain
-        total_visits = 0
-        print('_______________________________________________________________________________')
-        print('_______________________________________________________________________________')
+            actions, scores, rewards = self.get_scores_of_node(current_node)
+            if len(actions) > 0:
+                max_reward_idx = np.argmax(rewards)
+                max_score_idx = np.argmax(scores)
+                for action_idx, action in enumerate(actions):
+                    action_stats = current_node.actions[action]
+                    best_score_pointer = ''
+                    if chosen_action is None:
+                        if action_idx == max_reward_idx:
+                            best_score_pointer = '@\t'
+                    else:
+                        if action == chosen_action:
+                            best_score_pointer = '@\t'
+                    best_reward_pointer = ''
+                    if action_idx == max_score_idx:
+                        best_reward_pointer = 'O\t'
 
-        actions, scores, rewards = self.get_scores_of_node(current_node)
-        if len(actions) > 0:
-            max_reward_idx = np.argmax(rewards)
-            max_score_idx = np.argmax(scores)
-            for action_idx, action in enumerate(actions):
-                action_stats = current_node.actions[action]
-                best_score_pointer = ''
-                if action_idx == max_reward_idx:
-                    best_score_pointer = '@\t'
-                best_reward_pointer = ''
-                if action_idx == max_score_idx:
-                    best_reward_pointer = 'O\t'
+                    visits = action_stats['Visits']
+                    total_visits += visits
+                    wins = action_stats.get('GOAL', 0)
+                    loops = action_stats.get('LOOP', 0)
+                    deadends = action_stats.get('DEAD END', 0)
+                    depth_cap = action_stats.get('DEPTH CAP', 0)
+                    if visits == 0:
+                        visits = -1
+                    action = actions[action_idx]
+                    msg = ''
+                    msg += '[# {:>3}] '.format(action_idx + 1)
+                    # msg += '[Expended: {}]\t'.format(child.isFullyExpanded)
+                    msg += "Score: {:>+.6f}\t".format(scores[action_idx])
+                    msg += "Rewards: {:>+.5f}\t".format(rewards[action_idx])
+                    msg += "Wins: {}/{} ({:>.3f})\t".format(wins, visits, float(wins) / visits)
+                    msg += "loops: {}/{} ({:>.3f})\t".format(loops, visits, float(loops) / visits)
+                    msg += "dead-ends: {}/{} ({:>.3f})\t".format(deadends, visits, float(deadends) / visits)
+                    msg += "depth-cap: {}/{} ({:>.3f})\t".format(depth_cap, visits, float(depth_cap) / visits)
+                    # msg += "DeadEnds: {}/{}\t".format(child.dead_ends, visits)
+                    # msg += "Steps: {:>5.2f}\t".format(float(child.total_steps) / child.numVisits)
+                    msg += "{}{}{}".format(best_reward_pointer, best_score_pointer, action)
+                    print(msg)
+            else:
+                print("NO AVAILABLE ACTIONS")
+            print("-------------------------------------------------------------------------------")
+            msg = ''
+            msg += 'State: {}\n'.format(self.current_node_sig)
+            msg += 'Current predicates: {}\t'.format(current_predicates)
+            msg += 'Total visits: {}\t'.format(total_visits)
+            msg += 'Avg depth: {:>.1f}\t'.format(avg_depth)
+            msg += 'Tree size: {}\t'.format(current_node_id)
+            print(msg)
 
-                visits = action_stats['Visits']
-                total_visits += visits
-                wins = action_stats.get('GOAL', 0)
-                loops = action_stats.get('LOOP', 0)
-                deadends = action_stats.get('DEAD END', 0)
-                depth_cap = action_stats.get('DEPTH CAP', 0)
-                if visits == 0:
-                    visits = -1
-                action = actions[action_idx]
-                msg = ''
-                # msg += '[Expended: {}]\t'.format(child.isFullyExpanded)
-                msg += "Score: {:>+.6f}\t".format(scores[action_idx])
-                msg += "Rewards: {:>+.5f}\t".format(rewards[action_idx])
-                msg += "Wins: {}/{} ({:>.3f})\t".format(wins, visits, float(wins) / visits)
-                msg += "loops: {}/{} ({:>.3f})\t".format(loops, visits, float(loops) / visits)
-                msg += "dead-ends: {}/{} ({:>.3f})\t".format(deadends, visits, float(deadends) / visits)
-                msg += "depth-cap: {}/{} ({:>.3f})\t".format(depth_cap, visits, float(depth_cap) / visits)
-                # msg += "DeadEnds: {}/{}\t".format(child.dead_ends, visits)
-                # msg += "Steps: {:>5.2f}\t".format(float(child.total_steps) / child.numVisits)
-                msg += "{}{}{}".format(best_reward_pointer, best_score_pointer, action)
-                print(msg)
+            images = self.uncaptured_images(current_node.state)
+            print("Missing images:")
+            for image_idx, image in enumerate(images):
+                print("[{}]\t{}".format(image_idx + 1, image))
+            print('')
+            print('_______________________________________________________________________________')
         else:
-            print("NO AVAILABLE ACTIONS")
-        print("-------------------------------------------------------------------------------")
-        msg = ''
-        msg += 'Current predicates: {}\t'.format(current_predicates)
-        msg += 'Total visits: {}\t'.format(total_visits)
-        msg += 'Avg depth: {:>.1f}\t'.format(avg_depth)
-        msg += 'Tree size: {}\t'.format(current_node_id)
-        print(msg)
-        print('')
-        print('_______________________________________________________________________________')
+            pass
 
     ##############################################################################################
     ###################################     node handling###   ###################################
     ##############################################################################################
 
-    def mtc_generate_node(self, state, parent=None, originating_action=None):
-        state_sig = get_id_for_dict(state)
+    def mtc_generate_node(self, state, parent_node=None, originating_action=None):
+        state_sig = self.state_to_str(state)
         state_node = self.mtc_guide.get(state_sig, None)
         if state_node is None:
-            state_node = treeNode(state=state, parent=parent, originating_action=originating_action,
+            state_node = treeNode(state=state, parent=parent_node, originating_action=originating_action,
                                   exploration_constant=self.mtc_exploration_constant)
-            if parent is not None:
-                parent_sig = parent.state_sig
+            if parent_node is not None:
+                parent_sig = parent_node.state_sig
                 state_node.parent_sig = parent_sig
-                state_node.depth = parent.depth + 1
+                state_node.depth = parent_node.depth + 1
             state_node.state_sig = state_sig
             is_dead_end = self.hit_dead_end(state)
             goals_remaining = self.unfulfilled_goals_count(state)
@@ -434,24 +598,34 @@ class MyExecutor(object):
             state_node.goalRemain = goals_remaining
             self.mtc_guide[state_node.state_sig] = state_node
         else:
+            # print("Generating existing Node")
             pass
 
         return state_node
 
-    def get_scores_of_node(self, node):
+    def get_scores_of_node(self, node, legal_actions=None):
+        valid_actions = dict()
+        if legal_actions is not None:
+            valid_actions = {t_action: True for t_action in legal_actions}
+
         actions = list()
         scores = list()
         rewards = list()
         for action, action_stats in node.actions.items():
+            if legal_actions is not None:
+                legal_action = valid_actions.get(action, False)
+                if not legal_action:
+                    continue
+
             if node.numVisits <= 0:
-                reward = 0
+                reward = 0.0
                 score = float(2 ** 30)
 
             elif action_stats['Visits'] <= 0:
-                reward = 0
+                reward = 0.0
                 score = float(2 ** 30)
             else:
-                reward = float(action_stats['Rewards']) / action_stats['Visits']
+                reward = float(action_stats['Rewards']) / float(action_stats['Visits'])
                 exploration_factor = math.sqrt(math.log(node.numVisits) / action_stats['Visits'])
                 score = reward + (self.mtc_exploration_constant * exploration_factor)
 
@@ -468,25 +642,25 @@ class MyExecutor(object):
     def export(self):
         if not self.train_mode:
             return False
+        else:
 
-        output = dict()
-        sys.setrecursionlimit(10000)
-        output['mtc_tree'] = pickle.dumps(self.mtc_root)
-        output['total_agent_runs'] = self.total_agent_runs
-        if self.train_mode:
             with open(self.policy_path, 'w') as ffile:
-                json.dump(output, ffile, indent=4)
+                # json.dump(output, ffile, indent=4)
+                pickle.dump(self.mtc_guide, ffile)
 
         return True
 
     def import_policy(self):
-        with open(self.policy_path) as json_file:
-            output = json.load(json_file)
+        if os.path.exists(self.policy_path):
+            with open(self.policy_path) as ffile:
+                # output = json.load(ffile)
+                self.mtc_guide = pickle.load(ffile)
 
-        self.mtc_root_x = pickle.loads(output['mtc_tree'])
-        self.total_agent_runs = output['total_agent_runs'] + 1
+            # self.mtc_guide = pickle.loads(output['mtc_tree_{}'.format(self.world_name)])
+            # self.total_agent_runs = output['total_agent_runs_{}'.format(self.world_name)] + 1
 
     def get_valid_action_from_state(self, state):
+
         possible_actions = []
         for (name, action) in self.services.valid_actions.provider.parser.actions.items():
             for candidate in self.services.valid_actions.provider.get_valid_candidates_for_action(state, action):
@@ -527,25 +701,58 @@ class MyExecutor(object):
 
     def apply_action_to_state(self, action, state):
         state_copy = self.services.parser.copy_state(state)
-        self.services.parser.apply_action_to_state(action, state_copy, check_preconditions=False)
+        action_name, param_names = self.services.parser.parse_action(action)
+        action_is_determinitic = self.is_action_determenistic[action_name]
+        if action_is_determinitic:
+            self.services.parser.apply_action_to_state(action, state_copy, check_preconditions=False)
+
+        else:
+            action = self.services.parser.actions[action_name]
+            params = map(self.services.parser.get_object, param_names)
+            param_mapping = action.get_param_mapping(params)
+            chosen_outcome = action.choose_random_effect()
+
+            possible_outcomes = len(action.prob_list)
+            if chosen_outcome >= possible_outcomes:
+                print("BAD CHOSEN OUTCOME")
+
+            index = chosen_outcome
+            for (predicate_name, entry) in action.to_delete(param_mapping, index):
+                predicate_set = state_copy[predicate_name]
+                if entry in predicate_set:
+                    predicate_set.remove(entry)
+
+            for (predicate_name, entry) in action.to_add(param_mapping, index):
+                state_copy[predicate_name].add(entry)
+
         return state_copy
 
-    def find_unfulfilled_subgoal(self, subgoal, state):
-        if subgoal.test(state):
-            return None
+    def get_all_goal_identities(self, goal=None):
+        if goal is None:
+            goal = self.services.goal_tracking.uncompleted_goals[0]
+
+        if type(goal) is pddlsim.parser_independent.Literal:
+            return list(goal.args)
         else:
-            if type(subgoal) == pddlsim.parser_independent.Literal:
-                return subgoal
+            ret = list()
+            for subsubgoal in goal.parts:
+                ret += self.get_all_goal_identities(subsubgoal)
+            return ret
+
+    def get_all_goal_planets(self, state, goal=None):
+        if goal is None:
+            goal = self.services.goal_tracking.uncompleted_goals[0]
+
+        if type(goal) is pddlsim.parser_independent.Literal:
+            if not goal.test(state):
+                return [goal.args[0]]
             else:
-                for subsubgoal in subgoal.parts:
-                    l = self.find_unfulfilled_subgoal(subsubgoal, state)
-                    if l is not None:
-                        # Got one
-                        return l
-                    else:
-                        # Keep looking
-                        pass
-                return None
+                return list()
+        else:
+            ret = list()
+            for subsubgoal in goal.parts:
+                ret += self.get_all_goal_planets(state, subsubgoal)
+            return ret
 
     def unfulfilled_goals_count(self, state, goal=None):
         if goal is None:
@@ -562,14 +769,30 @@ class MyExecutor(object):
                     counter += self.unfulfilled_goals_count(state, subsubgoal)
                 return counter
 
+    def uncaptured_images(self, state, goal=None):
+        if goal is None:
+            goal = self.services.goal_tracking.uncompleted_goals[0]
+
+        if goal.test(state):
+            return list()
+        else:
+            if type(goal) is pddlsim.parser_independent.Literal:
+                return [goal.args]
+            else:
+                counter = list()
+                for subsubgoal in goal.parts:
+                    counter += self.uncaptured_images(state, subsubgoal)
+                return counter
+
     def is_terminal(self, state):
         goal = self.services.goal_tracking.uncompleted_goals[0]
         hit_goal = goal.test(state)
         dead_end = len(self.get_valid_action_from_state(state)) == 0
         return hit_goal or dead_end
 
-    def hit_goal(self, state):
-        goal = self.services.goal_tracking.uncompleted_goals[0]
+    def hit_goal(self, state, goal=None):
+        if goal is None:
+            goal = self.services.goal_tracking.uncompleted_goals[0]
         hit_goal = goal.test(state)
         return hit_goal
 
@@ -588,14 +811,22 @@ class MyExecutor(object):
 
         return False
 
+    def check_reveal_predicates(self, state):
+        if self.is_hidden_info_game:
+            for hidden_predicate in self.services.valid_actions.provider.parser.revealable_predicates:
+                if hidden_predicate.is_relevant(state):
+                    hidden_predicate_prob = hidden_predicate.probability
+                    if np.random.random() <= hidden_predicate_prob:
+                        hidden_knowledge_items = hidden_predicate.effects
+                        for hidden_knowledge_key, hidden_knowledge in hidden_knowledge_items:
+                            state[hidden_knowledge_key].add(hidden_knowledge)
+        return state
+
     ###############################################################################################
     ###############################################################################################
 
     def state_to_str(self, state):
-        # state_copy = self.services.parser.copy_state(state)
-        # state_copy.pop('=')
-        # ret = str(state_copy)
-        # ret = state_copy['at'].pop()[1]
+        # ret = list(state['at'])[0][1]
         ret = get_id_for_dict(state)
         return ret
 
@@ -609,10 +840,15 @@ class MyExecutor(object):
 
 
 if __name__ == '__main__':
+
     # Get args
     worlds = dict()
+    worlds['prob_hidden_maze'] = (r"C:\school\cognitive\cognitive_ex_4\maze_domain_multi_effect_food.pddl",
+                                  r"C:\school\cognitive\cognitive_ex_4\t_5_5_5_food.pddl")
     worlds['satellite'] = (r"C:\school\cognitive\cognitive_project\satellite_domain_multi.pddl",
                            r"C:\school\cognitive\cognitive_project\satellite_problem_multi.pddl")
+    worlds['satellite_easy'] = (r"C:\school\cognitive\cognitive_project\satellite_domain_multi.pddl",
+                                r"C:\school\cognitive\cognitive_project\satellite_problem_multi_easy.pddl")
     worlds['freecell'] = (r"C:\school\cognitive\cognitive_project\freecell_domain.pddl",
                           r"C:\school\cognitive\cognitive_project\freecell_problem.pddl")
     worlds['rover'] = (r"C:\school\cognitive\cognitive_project\rover_domain.pddl",
@@ -621,8 +857,36 @@ if __name__ == '__main__':
                         r"C:\school\cognitive\cognitive_project\problem_simple.pddl")
     worlds['simple_web'] = (r"C:\school\cognitive\cognitive_project\domain_simple.pddl",
                             r"C:\school\cognitive\cognitive_project\problem_simple_web.pddl")
+    worlds['satalite_detemenistic'] = (r"C:\school\cognitive\cognitive_project\satellite_domain_determenistic.pddl",
+                                       r"C:\school\cognitive\cognitive_project\satellite_problem_determenistic_easy.pddl")
 
-    current_world = 'rover'
+    worlds['simple_pro'] = (r"C:\school\cognitive\cognitive_project\pro-domains-problems\domain (1).pddl",
+                            r"C:\school\cognitive\cognitive_project\pro-domains-problems\problem (1).pddl")
+    worlds['maze_prob_pro_1'] = (
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\maze_domain_multi_effect_food.pddl",
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\t_5_5_5_food-prob0.pddl")
+
+    worlds['maze_prob_pro_2'] = (
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\maze_domain_multi_effect_food.pddl",
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\t_5_5_5_food-prob1.pddl")
+
+    worlds['maze_prob_pro_3'] = (
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\maze_domain_multi_effect_food.pddl",
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\t_10_10_10.pddl")
+
+    worlds['freecell_pro'] = (
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\freecell_domain (1).pddl",
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\freecell_problem (1).pddl")
+
+    worlds['rover_pro'] = (
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\rover_domain (2).pddl",
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\rover_problem (2).pddl")
+
+    worlds['sat_simplyfied_pro'] = (
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\satellite_domain.pddl",
+        r"C:\school\cognitive\cognitive_project\pro-domains-problems\satellite_problem_easy.pddl")
+
+    current_world = 'satellite'
     args = sys.argv
     run_mode_flag = 'L'
     domain_path = worlds[current_world][0]  # args[2]
@@ -631,25 +895,37 @@ if __name__ == '__main__':
     train_mode = 'L' in run_mode_flag
 
     clear_policy(policy_path)
-
+    global_start_time = datetime.now()
     if train_mode:
         # Train mode
-        global_start_time = datetime.now()
+
         iterations = 1
         moving_average_window = 1
         results_moving_average = list()
         rewards_moving_average = list()
         for current_simulation_id in range(iterations):
+            iteration_start_time = datetime.now()
             simulator = LocalSimulator()
             executor = MyExecutor(policy_path=policy_path, train_mode=True)
             ret_message = simulator.run(domain_path, problem_path, executor)
             print(ret_message)
+
+            completion_time = datetime.now()
+            msg = ''
+            msg += '[Iter: {}/{}]'.format(current_simulation_id + 1, iterations)
+            msg += 'Global runtime: {}\t'.format(completion_time - global_start_time)
+            msg += 'iteration runtime: {}\t'.format(completion_time - iteration_start_time)
+            print(msg)
         print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
 
-    else:
-
-        # Test mode
-        simulator = LocalSimulator()
-        executor = MyExecutor(policy_path=policy_path, train_mode=False, steps_until_reset=270)
-        ret_message = simulator.run(domain_path, problem_path, executor)
-        print(ret_message)
+    # Test mode
+    iteration_start_time = datetime.now()
+    simulator = LocalSimulator()
+    executor = MyExecutor(policy_path=policy_path, train_mode=False, steps_until_reset=270)
+    ret_message = simulator.run(domain_path, problem_path, executor)
+    print(ret_message)
+    completion_time = datetime.now()
+    msg = ''
+    msg += 'Global runtime: {}\t'.format(completion_time - global_start_time)
+    msg += 'iteration runtime: {}\t'.format(completion_time - iteration_start_time)
+    print(msg)
