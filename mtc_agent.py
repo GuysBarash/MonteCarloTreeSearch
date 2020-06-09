@@ -79,26 +79,26 @@ class treeNode:
 
 class MyExecutor(object):
 
-    def __init__(self, policy_path=None, train_mode=True, steps_until_reset=65):
+    def __init__(self, policy_path=None, train_mode=True):
         self.train_mode = train_mode
         self.mtc_root = None
         self.mtc_root_sig = None
 
         self.mtc_guide = dict()
 
-        self.completion_reward = 30.0
+        self.completion_reward = 60.0
         self.predicat_completion_reward = +10.0
         self.dead_end_reward = -2.0
         self.depth_limit_reward = 0.0
         self.step_penelty = -0.01
         self.step_in_loop_penelty = 0.0
-        self.history_repeat_penalty = -1.0
+        self.history_repeat_penalty = -2.0
         self.loop_break_penelty = -4.0
 
         self.visit_limit_to_avoid_loops = 4
         self.depth_limit = 45
         self.current_step = 0
-        self.steps_cap = 100
+        self.steps_cap = 250
         self.total_agent_runs = 0
         self.policy_path = policy_path
 
@@ -135,17 +135,21 @@ class MyExecutor(object):
             self.import_policy()
 
         if self.train_mode:
+            if os.path.exists(self.policy_path):
+                print("Only a single training session is needed. Exiting.")
+                exit(128)
+
             self.mtc_exploration_constant = 13 * math.sqrt(2.0)
             self.mtc_iteration_limit = 40
         else:
             self.mtc_exploration_constant = 5 * math.sqrt(2.0)
-            self.mtc_iteration_limit = 2
+            self.mtc_iteration_limit = 40
 
         if 'satellite' in self.world_name:
             # BFS Mode
             print("BFS MODE")
             self.mtc_exploration_constant = 13 * math.sqrt(2.0)
-            self.mtc_iteration_limit = 500
+            self.mtc_iteration_limit = 250
             self.depth_limit = 3
             self.mtc_guide = dict()
 
@@ -158,7 +162,7 @@ class MyExecutor(object):
 
         goals_reached = self.services.goal_tracking.reached_all_goals()
         self.current_step += 1
-        self.traveled_path_histogram[current_state_sig] = self.current_step
+        self.traveled_path_histogram[current_state_sig] = self.traveled_path_histogram.get(current_state_sig, 0) + 1
 
         if goals_reached:
             self.export()
@@ -191,14 +195,23 @@ class MyExecutor(object):
             if self.current_node is None:
                 self.current_node = self.mtc_generate_node(state=initial_state)
 
-        time.sleep(0.1)
         depths = list()
-        for current_mtc_idx in tqdm(range(self.mtc_iteration_limit), desc='[Step: {}]'.format(self.current_step)):
+        simulation_runtime_start = datetime.now()
+        for current_mtc_idx in range(self.mtc_iteration_limit):
+            # for current_mtc_idx in tqdm(range(self.mtc_iteration_limit), desc='[Step: {}]'.format(self.current_step)):
             reward, chosen_path, path_depth = self.mtc_executeRound(self.current_node_sig)
             depths += [path_depth]
             # print("Round {}/{}\tReward: {}\tAction: {}".format(i + 1, self.mtc_iteration_limit, reward,
             #                                                    chosen_path))
-        time.sleep(0.1)
+        if self.train_mode:
+            simulation_duration = datetime.now() - simulation_runtime_start
+            msg = ''
+            msg += "[Step {:>3}]\t".format(self.current_step)
+            msg += "[Duration {}]\t".format(simulation_duration)
+            msg += "[Iterations {}]\t".format(self.mtc_iteration_limit)
+            msg += "[It/seconds: {:>.3f}]\t".format(
+                float(self.mtc_iteration_limit) / simulation_duration.total_seconds())
+            print(msg)
 
         avg_depth = np.mean(depths)
         return avg_depth
@@ -565,10 +578,10 @@ class MyExecutor(object):
             msg += 'Tree size: {}\t'.format(current_node_id)
             print(msg)
 
-            images = self.uncaptured_images(current_node.state)
-            print("Missing images:")
-            for image_idx, image in enumerate(images):
-                print("[{}]\t{}".format(image_idx + 1, image))
+            # images = self.uncaptured_images(current_node.state)
+            # print("Missing images:")
+            # for image_idx, image in enumerate(images):
+            #     print("[{}]\t{}".format(image_idx + 1, image))
             print('')
             print('_______________________________________________________________________________')
         else:
@@ -643,7 +656,7 @@ class MyExecutor(object):
         if not self.train_mode:
             return False
         else:
-
+            print('Exporting policy to: {}'.format(self.policy_path))
             with open(self.policy_path, 'w') as ffile:
                 # json.dump(output, ffile, indent=4)
                 pickle.dump(self.mtc_guide, ffile)
@@ -888,9 +901,9 @@ if __name__ == '__main__':
 
     current_world = 'satellite'
     args = sys.argv
-    run_mode_flag = 'L'
-    domain_path = worlds[current_world][0]  # args[2]
-    problem_path = worlds[current_world][1]  # args[3]
+    run_mode_flag = args[1]  # 'L'
+    domain_path = args[2]  # worlds[current_world][0]
+    problem_path = args[3]  # worlds[current_world][1]
     policy_path = 'POLICYFILE'
     train_mode = 'L' in run_mode_flag
 
@@ -918,14 +931,15 @@ if __name__ == '__main__':
             print(msg)
         print("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@")
 
-    # Test mode
-    iteration_start_time = datetime.now()
-    simulator = LocalSimulator()
-    executor = MyExecutor(policy_path=policy_path, train_mode=False, steps_until_reset=270)
-    ret_message = simulator.run(domain_path, problem_path, executor)
-    print(ret_message)
-    completion_time = datetime.now()
-    msg = ''
-    msg += 'Global runtime: {}\t'.format(completion_time - global_start_time)
-    msg += 'iteration runtime: {}\t'.format(completion_time - iteration_start_time)
-    print(msg)
+    else:
+        # Test mode
+        iteration_start_time = datetime.now()
+        simulator = LocalSimulator()
+        executor = MyExecutor(policy_path=policy_path, train_mode=False)
+        ret_message = simulator.run(domain_path, problem_path, executor)
+        print(ret_message)
+        completion_time = datetime.now()
+        msg = ''
+        msg += 'Global runtime: {}\t'.format(completion_time - global_start_time)
+        msg += 'iteration runtime: {}\t'.format(completion_time - iteration_start_time)
+        print(msg)
