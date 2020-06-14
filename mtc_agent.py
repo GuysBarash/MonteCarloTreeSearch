@@ -904,7 +904,10 @@ if __name__ == '__main__':
     run_mode_flag = args[1]  # 'L'
     domain_path = args[2]  # worlds[current_world][0]
     problem_path = args[3]  # worlds[current_world][1]
-    policy_path = 'POLICYFILE'
+    if len(args) > 4:
+        policy_path = args[4]
+    else:
+        policy_path = 'POLICYFILE'
     train_mode = 'L' in run_mode_flag
 
     clear_policy(policy_path)
