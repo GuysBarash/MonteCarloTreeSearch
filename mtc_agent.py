@@ -13,6 +13,8 @@ from datetime import datetime
 import pddlsim
 from pddlsim.local_simulator import LocalSimulator
 
+import pandas as pd
+
 from tqdm import tqdm
 import time
 
@@ -153,6 +155,8 @@ class MyExecutor(object):
             self.depth_limit = 3
             self.mtc_guide = dict()
 
+        self.statdf = pd.DataFrame(columns=['Step', 'Reward', 'Score'])
+
     def next_action(self):
         current_state = self.services.perception.get_state()
         current_state_sig = self.state_to_str(current_state)
@@ -166,6 +170,7 @@ class MyExecutor(object):
 
         if goals_reached:
             self.export()
+            self.statdf.to_csv('Results.csv')
             return None
         if self.current_step > self.steps_cap:
             self.export()
@@ -493,6 +498,8 @@ class MyExecutor(object):
             max_val = np.max(rewards)
             indexes = np.where(rewards == max_val)[0]
             chosen_node_idx = np.random.choice(indexes)
+            max_score = scores[chosen_node_idx]
+            self.statdf.loc[self.current_step] = [self.current_step, max_val, max_score]
         else:
             max_val = np.max(scores)
             indexes = np.where(scores == max_val)[0]
@@ -862,6 +869,8 @@ if __name__ == '__main__':
                            r"C:\school\cognitive\cognitive_project\satellite_problem_multi.pddl")
     worlds['satellite_easy'] = (r"C:\school\cognitive\cognitive_project\satellite_domain_multi.pddl",
                                 r"C:\school\cognitive\cognitive_project\satellite_problem_multi_easy.pddl")
+    worlds['deep_maze'] = (r"C:\school\cognitive\cognitive_project\maze_domain.pddl",
+                           r"C:\school\cognitive\cognitive_project\maze_problem.pddl")
     worlds['freecell'] = (r"C:\school\cognitive\cognitive_project\freecell_domain.pddl",
                           r"C:\school\cognitive\cognitive_project\freecell_problem.pddl")
     worlds['rover'] = (r"C:\school\cognitive\cognitive_project\rover_domain.pddl",
@@ -870,8 +879,8 @@ if __name__ == '__main__':
                         r"C:\school\cognitive\cognitive_project\problem_simple.pddl")
     worlds['simple_web'] = (r"C:\school\cognitive\cognitive_project\domain_simple.pddl",
                             r"C:\school\cognitive\cognitive_project\problem_simple_web.pddl")
-    worlds['satalite_detemenistic'] = (r"C:\school\cognitive\cognitive_project\satellite_domain_determenistic.pddl",
-                                       r"C:\school\cognitive\cognitive_project\satellite_problem_determenistic_easy.pddl")
+    worlds['satalite_detemenistic'] = (r"C:\school\cognitive\cognitive_project\satellite_domain.pddl",
+                                       r"C:\school\cognitive\cognitive_project\satellite_problem.pddl")
 
     worlds['simple_pro'] = (r"C:\school\cognitive\cognitive_project\pro-domains-problems\domain (1).pddl",
                             r"C:\school\cognitive\cognitive_project\pro-domains-problems\problem (1).pddl")
@@ -899,11 +908,12 @@ if __name__ == '__main__':
         r"C:\school\cognitive\cognitive_project\pro-domains-problems\satellite_domain.pddl",
         r"C:\school\cognitive\cognitive_project\pro-domains-problems\satellite_problem_easy.pddl")
 
-    current_world = 'satellite'
+    current_world = 'rover'
     args = sys.argv
-    run_mode_flag = args[1]  # 'L'
-    domain_path = args[2]  # worlds[current_world][0]
-    problem_path = args[3]  # worlds[current_world][1]
+    run_mode_flag = args[
+        1]  # 'L'
+    domain_path = worlds[current_world][0]
+    problem_path = worlds[current_world][1]
     if len(args) > 4:
         policy_path = args[4]
     else:
